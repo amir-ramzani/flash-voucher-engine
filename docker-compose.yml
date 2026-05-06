@@ -1,0 +1,64 @@
+x-app-env: &app-env
+  REDIS_URL: redis://redis:6379/0
+  DYNAMODB_ENDPOINT: http://dynamodb:8000
+  AWS_REGION: ap-southeast-1
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+  AUTH_MODE: dev
+  DEV_JWT_SECRET: ${DEV_JWT_SECRET:-dev-secret-change-me-at-least-32-bytes!}
+  RATE_LIMIT_PER_SEC: ${RATE_LIMIT_PER_SEC:-5}
+  WORKER_MIN_IDLE_MS: ${WORKER_MIN_IDLE_MS:-5000}
+  METRICS_EMF: ${METRICS_EMF:-false}
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports: ["8001:8000"]
+
+  init:
+    build: .
+    environment: *app-env
+    command: ["python", "-m", "common.bootstrap"]
+    depends_on: [dynamodb]
+    restart: "no"
+
+  api:
+    build: .
+    environment: *app-env
+    ports: ["8000:8000"]
+    depends_on:
+      redis: { condition: service_healthy }
+      init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 10
+
+  worker:
+    build: .
+    environment: *app-env
+    command: ["python", "-m", "worker.main"]
+    depends_on:
+      redis: { condition: service_healthy }
+      init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  # On-demand: docker compose run --rm reconciler python -m reconciler.main [--fix]
+  reconciler:
+    build: .
+    environment: *app-env
+    command: ["python", "-m", "reconciler.main", "--loop", "60"]
+    depends_on:
+      redis: { condition: service_healthy }
+      init: { condition: service_completed_successfully }
+    profiles: ["tools"]
