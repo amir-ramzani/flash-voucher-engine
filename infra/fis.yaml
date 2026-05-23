@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flash-sale voucher engine - AWS Fault Injection Service experiments (Weekend 3).
+  Run while a load test is in flight, then check the reconciler output / dashboard.
+  NOTE: FIS action ids evolve; verify against `aws fis list-actions` before first use.
+
+Parameters:
+  AppStackName:
+    Type: String
+    Default: flash-voucher
+    Description: Name of the stack deployed from stack.yaml
+  AzToInterrupt:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: AZ currently hosting the Redis primary (see ElastiCache console)
+
+Resources:
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: fis.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: fis-actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecs:StopTask, ecs:ListTasks, ecs:DescribeTasks]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticache:InterruptClusterAzPower
+                  - elasticache:DescribeReplicationGroups
+                  - tag:GetResources
+                Resource: "*"
+
+  # Chaos 1: kill every worker task mid-sale. ECS restarts them; pending events are
+  # recovered with XAUTOCLAIM. Expect: zero lost claims, a spike in StreamLag.
+  KillWorkers:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Stop all worker tasks
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions: [{ Source: none }]
+      Targets:
+        Workers:
+          ResourceType: aws:ecs:task
+          SelectionMode: ALL
+          Parameters:
+            cluster: { "Fn::ImportValue": !Sub "${AppStackName}-Cluster" }
+            service: { "Fn::ImportValue": !Sub "${AppStackName}-WorkerService" }
+      Actions:
+        StopWorkers:
+          ActionId: aws:ecs:stop-task
+          Targets: { Tasks: Workers }
+      Tags: { Name: !Sub "${AppStackName}-kill-workers" }
+
+  # Chaos 2: power-interrupt the primary's AZ -> Multi-AZ failover to the replica.
+  # Expect: brief claim errors, possibly a few lost acknowledged claims (async
+  # replication). The DynamoDB cap keeps issued <= totalStock; the reconciler reports
+  # dynamo_only users and restores them; RevokedAlarm fires if Redis re-sold stock.
+  RedisFailover:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Interrupt power to the Redis primary's AZ
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions: [{ Source: none }]
+      Targets:
+        Redis:
+          ResourceType: aws:elasticache:replicationgroup
+          SelectionMode: ALL
+          Parameters:
+            availabilityZoneIdentifier: !Ref AzToInterrupt
+          ResourceTags:
+            fis-target: !Sub "${AppStackName}-redis"
+      Actions:
+        InterruptAz:
+          ActionId: aws:elasticache:replicationgroup-interrupt-az-power
+          Parameters: { duration: PT5M }
+          Targets: { ReplicationGroups: Redis }
+      Tags: { Name: !Sub "${AppStackName}-redis-failover" }
