@@ -1,0 +1,448 @@
+openapi: 3.1.0
+info:
+  title: Flash-Sale Voucher Engine
+  description: |
+    Flash-sale voucher engine: many users race to claim a fixed number of vouchers.
+
+    **Guarantees**
+    * At most one voucher per user per campaign; duplicate taps return the same code.
+    * Exactly `totalStock` `WON` responses while Redis is healthy; the durable store
+      (DynamoDB) never holds more than `totalStock` issued vouchers.
+
+    **Authentication** — every endpoint except `/health` needs `Authorization: Bearer <JWT>`.
+    The user id is the token's `sub`. Admin endpoints need `admin` in `cognito:groups`.
+    Locally (`AUTH_MODE=dev`) mint tokens with `python -m common.devtokens <user> [--admin]`.
+
+    **Voucher lifecycle**: `PENDING` (claimed, persisting) → `ISSUED` → `REDEEMED`.
+    `REVOKED` = the claim was refused by the durable cap (only after a Redis failover).
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      tags:
+      - ops
+      summary: Health check (API up + Redis reachable)
+      description: 'Unauthenticated. Returns 200 when the API process is up **and** can reach Redis (the
+        claim path depends on it), 503 otherwise. Used by the ALB target group and the docker-compose
+        healthcheck. DynamoDB is deliberately not checked: claims keep working while it is degraded (the
+        worker retries).'
+      operationId: health
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthOut'
+              example:
+                ok: true
+        '503':
+          description: Redis unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+              example:
+                detail: redis unreachable
+  /campaigns:
+    post:
+      tags:
+      - campaigns
+      summary: Create a campaign (admin)
+      description: Writes the campaign to DynamoDB, then seeds Redis. Re-posting **identical** parameters
+        is idempotent (returns 200 and re-seeds Redis without refilling stock); different parameters for
+        an existing id return 409.
+      operationId: create_campaign
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CampaignOut'
+        '200':
+          description: Already existed with identical params
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CampaignOut'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '403':
+          description: Caller is not in the admin group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: Campaign exists with different parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /campaigns/{campaign_id}/claim:
+    post:
+      tags:
+      - claims
+      summary: Claim a voucher
+      description: 'Atomic check-then-claim in Redis. Safe to retry: a returning winner always gets `ALREADY`
+        with their original code, even after the window closes. Sold-out is a normal **200** outcome,
+        not an error.'
+      operationId: claim
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: campaign_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Campaign Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimOut'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '404':
+          description: Unknown campaign
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: '`NOT_STARTED` or `ENDED` — outside the claim window'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '429':
+          description: Per-user rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /campaigns/{campaign_id}/my-voucher:
+    get:
+      tags:
+      - claims
+      summary: Get my voucher for a campaign
+      description: Reads DynamoDB (strongly consistent); falls back to Redis and reports `PENDING` if
+        the worker hasn't persisted the claim yet.
+      operationId: my_voucher
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: campaign_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Campaign Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoucherOut'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '404':
+          description: You have no voucher in this campaign
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /vouchers/{code}/redeem:
+    post:
+      tags:
+      - vouchers
+      summary: Redeem my voucher
+      description: 'Conditional update `ISSUED → REDEEMED`. Only the owner (token `sub`) can redeem. While
+        the voucher is still `PENDING` this returns 409 with `Retry-After: 1`.'
+      operationId: redeem
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoucherOut'
+        '401':
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '404':
+          description: Malformed code, unknown voucher, or not yours
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: Already redeemed, revoked, or still being issued (retry)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    CampaignIn:
+      properties:
+        campaignId:
+          type: string
+          pattern: ^[a-z0-9][a-z0-9-]{0,39}$
+          title: Campaignid
+          description: Lowercase letters, digits and dashes; 1–40 chars; no dots.
+          examples:
+          - sale-1111
+        totalStock:
+          type: integer
+          maximum: 1000000.0
+          exclusiveMinimum: 0.0
+          title: Totalstock
+          description: Number of vouchers.
+        startAt:
+          type: string
+          format: date-time
+          title: Startat
+          description: Claim window start (timezone required).
+          examples:
+          - '2026-06-06T12:00:00Z'
+        endAt:
+          type: string
+          format: date-time
+          title: Endat
+          description: Claim window end, exclusive.
+          examples:
+          - '2026-06-06T12:30:00Z'
+      type: object
+      required:
+      - campaignId
+      - totalStock
+      - startAt
+      - endAt
+      title: CampaignIn
+    CampaignOut:
+      properties:
+        campaignId:
+          type: string
+          title: Campaignid
+        totalStock:
+          type: integer
+          title: Totalstock
+        startAt:
+          type: string
+          format: date-time
+          title: Startat
+        endAt:
+          type: string
+          format: date-time
+          title: Endat
+        remainingStock:
+          type: integer
+          title: Remainingstock
+          description: Live stock in Redis at the time of the call.
+      type: object
+      required:
+      - campaignId
+      - totalStock
+      - startAt
+      - endAt
+      - remainingStock
+      title: CampaignOut
+    ClaimOut:
+      properties:
+        result:
+          type: string
+          enum:
+          - WON
+          - ALREADY
+          - SOLD_OUT
+          - REVOKED
+          title: Result
+          description: '`WON`: you got a voucher. `ALREADY`: you claimed before — same code returned.
+            `SOLD_OUT`: no stock left. `REVOKED`: your earlier win was refused by the durable cap.'
+        voucherCode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Vouchercode
+          description: Present for WON and ALREADY. Format `<campaignId>.<10 chars>`.
+          examples:
+          - sale-1111.K7QZ3MWD9P
+      type: object
+      required:
+      - result
+      title: ClaimOut
+    ErrorOut:
+      properties:
+        detail:
+          type: string
+          title: Detail
+          examples:
+          - unknown campaign
+      type: object
+      required:
+      - detail
+      title: ErrorOut
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HealthOut:
+      properties:
+        ok:
+          type: boolean
+          title: Ok
+      type: object
+      required:
+      - ok
+      title: HealthOut
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    VoucherOut:
+      properties:
+        campaignId:
+          type: string
+          title: Campaignid
+        voucherCode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Vouchercode
+        status:
+          type: string
+          enum:
+          - PENDING
+          - ISSUED
+          - REDEEMED
+          - REVOKED
+          title: Status
+          description: '`PENDING` = claimed in Redis, not yet persisted (usually a few ms).'
+        claimedAt:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Claimedat
+          description: Epoch milliseconds.
+        redeemedAt:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Redeemedat
+          description: Epoch milliseconds.
+      type: object
+      required:
+      - campaignId
+      - voucherCode
+      - status
+      title: VoucherOut
+  securitySchemes:
+    HTTPBearer:
+      type: http
+      scheme: bearer
+tags:
+- name: campaigns
+  description: 'Admin: create and seed campaigns.'
+- name: claims
+  description: 'The hot path: claim a voucher, look up your voucher.'
+- name: vouchers
+  description: Redeem a voucher at checkout.
+- name: ops
+  description: Health checks.
+servers:
+- url: http://localhost:8000
+  description: Local (docker compose)
+- url: '{apiUrl}'
+  description: AWS (ApiUrl output of infra/stack.yaml)
+  variables:
+    apiUrl:
+      default: http://your-alb.example.com
