@@ -1,0 +1,695 @@
+{
+  "info": {
+    "name": "Flash-Sale Voucher Engine",
+    "version": "1.0.0",
+    "description": "Run top-to-bottom with the Collection Runner. `authMode=dev` signs tokens locally with `devJwtSecret` (server must run `AUTH_MODE=dev`). For Cognito, set `authMode=cognito` and paste access tokens into `userToken`, `otherUserToken` and `adminToken`. Change `userId` to act as another user. Full spec: docs/openapi.yaml.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{userToken}}"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Mint dev tokens (AUTH_MODE=dev on the server). Skipped when authMode=cognito.",
+          "function b64url(words) {",
+          "  return CryptoJS.enc.Base64.stringify(words)",
+          "    .replace(/=+$/, '').replace(/\\+/g, '-').replace(/\\//g, '_');",
+          "}",
+          "function mint(sub, groups) {",
+          "  const now = Math.floor(Date.now() / 1000);",
+          "  const enc = (o) => b64url(CryptoJS.enc.Utf8.parse(JSON.stringify(o)));",
+          "  const head = enc({ alg: 'HS256', typ: 'JWT' });",
+          "  const body = enc({ sub: sub, iat: now, exp: now + 3600, 'cognito:groups': groups });",
+          "  const sig = b64url(CryptoJS.HmacSHA256(head + '.' + body, pm.variables.get('devJwtSecret')));",
+          "  return head + '.' + body + '.' + sig;",
+          "}",
+          "if ((pm.variables.get('authMode') || 'dev') === 'dev') {",
+          "  pm.variables.set('userToken', mint(pm.variables.get('userId'), []));",
+          "  pm.variables.set('otherUserToken', mint(pm.variables.get('userId') + '-other', []));",
+          "  pm.variables.set('adminToken', mint(pm.variables.get('adminId'), ['admin']));",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "authMode",
+      "value": "dev"
+    },
+    {
+      "key": "devJwtSecret",
+      "value": "dev-secret-change-me-at-least-32-bytes!"
+    },
+    {
+      "key": "userId",
+      "value": "postman-user"
+    },
+    {
+      "key": "adminId",
+      "value": "postman-admin"
+    },
+    {
+      "key": "totalStock",
+      "value": "100"
+    },
+    {
+      "key": "campaignId",
+      "value": ""
+    },
+    {
+      "key": "startAt",
+      "value": ""
+    },
+    {
+      "key": "endAt",
+      "value": ""
+    },
+    {
+      "key": "voucherCode",
+      "value": ""
+    },
+    {
+      "key": "userToken",
+      "value": ""
+    },
+    {
+      "key": "otherUserToken",
+      "value": ""
+    },
+    {
+      "key": "adminToken",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Happy path (run in order)",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 ok', () => { pm.response.to.have.status(200); pm.expect(pm.response.json().ok).to.eql(true); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create campaign (admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "Creates a fresh campaign each run (random `campaignId`, window = now-5s \u2026 now+30m) so the flow is re-runnable. Set `totalStock` to taste.",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"campaignId\": \"{{campaignId}}\",\n  \"totalStock\": {{totalStock}},\n  \"startAt\": \"{{startAt}}\",\n  \"endAt\": \"{{endAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const id = 'pm-' + Date.now().toString(36);",
+                  "pm.collectionVariables.set('campaignId', id);",
+                  "pm.collectionVariables.set('startAt', new Date(Date.now() - 5000).toISOString());",
+                  "pm.collectionVariables.set('endAt', new Date(Date.now() + 30 * 60 * 1000).toISOString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 created', () => pm.response.to.have.status(201));",
+                  "pm.test('stock seeded', () => pm.expect(pm.response.json().remainingStock).to.eql(Number(pm.variables.get('totalStock'))));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Claim voucher",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns/{{campaignId}}/claim",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "claim"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('WON', () => pm.expect(b.result).to.eql('WON'));",
+                  "if (b.voucherCode) pm.collectionVariables.set('voucherCode', b.voucherCode);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Claim again (duplicate tap)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns/{{campaignId}}/claim",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "claim"
+              ]
+            },
+            "description": "Retries are safe: same code, no extra voucher.",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "pm.test('ALREADY', () => pm.expect(b.result).to.eql('ALREADY'));",
+                  "pm.test('same code', () => pm.expect(b.voucherCode).to.eql(pm.collectionVariables.get('voucherCode')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "My voucher",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns/{{campaignId}}/my-voucher",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "my-voucher"
+              ]
+            },
+            "description": "`PENDING` until the worker persists the claim (normally a few ms).",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "setTimeout(() => {}, 300); // give the worker a moment"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('PENDING or ISSUED', () => pm.expect(pm.response.json().status).to.be.oneOf(['PENDING', 'ISSUED']));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Redeem voucher",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/vouchers/{{voucherCode}}/redeem",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vouchers",
+                "{{voucherCode}}",
+                "redeem"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "setTimeout(() => {}, 300);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 REDEEMED', () => { pm.response.to.have.status(200); pm.expect(pm.response.json().status).to.eql('REDEEMED'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Redeem again (must fail)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/vouchers/{{voucherCode}}/redeem",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vouchers",
+                "{{voucherCode}}",
+                "redeem"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 already redeemed', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Negative cases",
+      "item": [
+        {
+          "name": "Claim without token \u2192 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns/{{campaignId}}/claim",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "claim"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create campaign as non-admin \u2192 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"campaignId\": \"forbidden\",\n  \"totalStock\": 1,\n  \"startAt\": \"2030-01-01T00:00:00Z\",\n  \"endAt\": \"2030-01-01T01:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Claim unknown campaign \u2192 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns/does-not-exist/claim",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "does-not-exist",
+                "claim"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Redeem someone else's voucher \u2192 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/vouchers/{{voucherCode}}/redeem",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vouchers",
+                "{{voucherCode}}",
+                "redeem"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{otherUserToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid campaign body \u2192 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/campaigns",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"campaignId\": \"Bad.Id\",\n  \"totalStock\": 0,\n  \"startAt\": \"x\",\n  \"endAt\": \"y\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
